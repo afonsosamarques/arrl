@@ -2,11 +2,15 @@ import torch
 from torch.optim import Adam
 from torch.autograd import Variable
 import torch.nn.functional as F
-from network import Critic, Actor
 import os
+import random
 import numpy as np
-from utils import RunningMeanStd
-from replay_memory import ReplayMemory, Transition
+
+from .network import Critic, Actor
+from .utils import RunningMeanStd
+from .replay_memory import ReplayMemory, Transition
+
+# from evaluation_protocol.helpers import EvalWrapper
 
 
 def soft_update(target, source, tau):
@@ -28,7 +32,7 @@ def get_free_gpu():
 def normalize(x, stats, device):
     if stats is None:
         return x
-    return (x - torch.Tensor(stats.mean).to(device)) / torch.Tensor(stats.var).sqrt().to(device)
+    return (x - torch.tensor(stats.mean, dtype=torch.float32).to(device)) / torch.tensor(stats.var, dtype=torch.float32).sqrt().to(device)
 
 
 def denormalize(x, stats):
@@ -39,18 +43,19 @@ def denormalize(x, stats):
 
 class DDPG:
     def __init__(self, gamma, tau, hidden_size, num_inputs, action_space, train_mode, alpha, replay_size,
-                 normalize_obs=True, normalize_returns=False, critic_l2_reg=1e-2):
-        if torch.cuda.is_available():
+                 normalize_obs=True, normalize_returns=False, critic_l2_reg=1e-2, device=None):
+        if device != None:
+            self.device = device
+        elif torch.cuda.is_available():
             self.device = torch.device('cuda')
             torch.backends.cudnn.enabled = False
-            self.Tensor = torch.cuda.FloatTensor
         else:
             self.device = torch.device('cpu')
-            self.Tensor = torch.FloatTensor
-
+    
         self.alpha = alpha
         self.train_mode = train_mode
-
+        self.hidden_size = hidden_size
+    
         self.num_inputs = num_inputs
         self.action_space = action_space
         self.critic_l2_reg = critic_l2_reg
@@ -93,11 +98,12 @@ class DDPG:
 
         self.memory = ReplayMemory(replay_size)
 
-    def eval(self):
-        self.actor.eval()
-        self.adversary.eval()
-        if self.train_mode:
-            self.critic.eval()
+    # def eval(self, mdp_type=None, **kwargs):
+    #     self.actor.eval()
+    #     self.adversary.eval()
+    #     if self.train_mode:
+    #         self.critic.eval()
+    #     return DDPGEvalWrapper(self, mdp_type)
 
     def train(self):
         self.actor.train()
@@ -116,36 +122,41 @@ class DDPG:
                     mu = self.actor(state)
                 mu = mu.data
                 if action_noise is not None:
-                    mu += self.Tensor(action_noise()).to(self.device)
-
-                mu = mu.clamp(-1, 1) * (1 - self.alpha)
+                    mu += torch.tensor(action_noise(), dtype=torch.float32).to(self.device)
+                
+                pr_mu = mu.clamp(-1, 1)
+                mu = pr_mu * (1 - self.alpha)
 
                 if param_noise is not None:
                     adv_mu = self.adversary_perturbed(state)
                 else:
                     adv_mu = self.adversary(state)
 
-                adv_mu = adv_mu.data.clamp(-1, 1) * self.alpha
-
-                mu += adv_mu
+                adv_mu = adv_mu.data.clamp(-1, 1)
+                mu += adv_mu  * self.alpha
             else:  # mdp_type == 'pr_mdp':
-                if np.random.rand() < (1 - self.alpha):
-                    if param_noise is not None:
-                        mu = self.actor_perturbed(state)
-                    else:
-                        mu = self.actor(state)
-                    mu = mu.data
-                    if action_noise is not None:
-                        mu += self.Tensor(action_noise()).to(self.device)
-
-                    mu = mu.clamp(-1, 1)
+                #
+                if param_noise is not None:
+                    pr_mu = self.actor_perturbed(state)
                 else:
-                    if param_noise is not None:
-                        mu = self.adversary_perturbed(state)
-                    else:
-                        mu = self.adversary(state)
+                    pr_mu = self.actor(state)
+                pr_mu = pr_mu.data
+                if action_noise is not None:
+                    pr_mu += torch.tensor(action_noise(), dtype=torch.float32).to(self.device)
 
-                    mu = mu.data.clamp(-1, 1)
+                pr_mu = pr_mu.clamp(-1, 1)
+                #
+                if param_noise is not None:
+                    adv_mu = self.adversary_perturbed(state)
+                else:
+                    adv_mu = self.adversary(state)
+
+                adv_mu = adv_mu.data.clamp(-1, 1)
+                
+                if np.random.rand() < (1 - self.alpha):
+                    mu = pr_mu
+                else:
+                    mu = adv_mu
 
         else:
             if param_noise is not None:
@@ -154,11 +165,12 @@ class DDPG:
                 mu = self.actor(state)
             mu = mu.data
             if action_noise is not None:
-                mu += self.Tensor(action_noise()).to(self.device)
+                mu += torch.tensor(action_noise(), dtype=torch.float32).to(self.device)
 
             mu = mu.clamp(-1, 1)
+            return mu
 
-        return mu
+        return mu, pr_mu * (1 - self.alpha), adv_mu * self.alpha
 
     def update_robust(self, state_batch, action_batch, reward_batch, mask_batch, next_state_batch, adversary_update,
                       mdp_type, robust_update_type):
@@ -347,3 +359,22 @@ class DDPG:
                 pass
             param = params[name]
             param += torch.randn(param.shape).to(self.device) * param_noise.current_stddev
+
+    def to(self, device=torch.device('cpu')):
+        self.device = device
+
+
+# class DDPGEvalWrapper(EvalWrapper):
+#     def __init__(self, model, mdp_type="nr_mdp", **kwargs):
+#         super().__init__(model)
+#         self.mdp_type = mdp_type
+    
+#     def get_action(self, state):
+#         state = torch.tensor(state, dtype=torch.float32)
+#         action, pr_action, adv_action = self.model.select_action(state, mdp_type=self.mdp_type)
+#         return pr_action.detach().cpu().numpy(), adv_action.detach().cpu().numpy()
+
+#     def get_batch_actions(self, states):
+#         states = torch.tensor(states, dtype=torch.float32)
+#         actions, pr_actions, adv_actions = self.model.select_action(states, mdp_type=self.mdp_type)
+#         return pr_actions.detach().cpu().numpy(), adv_actions.detach().cpu().numpy()

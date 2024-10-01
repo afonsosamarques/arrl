@@ -3,9 +3,9 @@ import torch
 import numpy as np
 
 
-def save_model(actor, adversary, obs_rms, rew_rms, basedir=None):
-    if not os.path.exists('models/'):
-        os.makedirs('models/')
+def save_model(agent, actor, adversary, obs_rms, rew_rms, basedir=None):
+    if not os.path.exists('{}/agents/'.format(basedir)):
+        os.makedirs('{}/agents/'.format(basedir))
 
     actor_path = "{}/ddpg_actor".format(basedir)
     adversary_path = "{}/ddpg_adversary".format(basedir)
@@ -15,7 +15,8 @@ def save_model(actor, adversary, obs_rms, rew_rms, basedir=None):
     torch.save(actor.state_dict(), actor_path)
     torch.save(adversary.state_dict(), adversary_path)
 
-    var_dict = {'obs_rms_mean': None, 'obs_rms_var': None, 'rew_rms_mean': None, 'rew_rms_var': None}
+    var_dict = {'obs_rms_mean': None, 'obs_rms_var': None, 'rew_rms_mean': None, 'rew_rms_var': None,
+                'hidden_size': agent.hidden_size, 'num_inputs': agent.num_inputs, 'action_space': agent.action_space, 'gamma': agent.gamma, 'tau': agent.tau}
     if obs_rms is not None:
         var_dict['obs_rms_mean'] = obs_rms.mean
         var_dict['obs_rms_var'] = obs_rms.var
@@ -31,10 +32,10 @@ def load_model(agent, basedir=None):
     vars_path = "{}/ddpg_vars".format(basedir)
 
     print('Loading models from {} {}'.format(actor_path, adversary_path))
-    agent.actor.load_state_dict(torch.load(actor_path, map_location=lambda storage, loc: storage))
-    agent.adversary.load_state_dict(torch.load(adversary_path, map_location=lambda storage, loc: storage))
+    agent.actor.load_state_dict(torch.load(actor_path, weights_only=False, map_location=lambda storage, loc: storage))
+    agent.adversary.load_state_dict(torch.load(adversary_path, weights_only=False, map_location=lambda storage, loc: storage))
 
-    var_dict = torch.load(vars_path)
+    var_dict = torch.load(vars_path,  weights_only=False)
     if var_dict['obs_rms_mean'] is not None:
         agent.obs_rms.mean = var_dict['obs_rms_mean']
         agent.obs_rms.var = var_dict['obs_rms_var']
